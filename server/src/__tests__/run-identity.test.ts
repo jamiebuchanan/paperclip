@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { GITHUB_BROKER_ANSWER_FILE } from "@paperclipai/adapter-utils/github-launcher";
+import { githubOperationLauncherDirectory } from "@paperclipai/adapter-utils/execution-target";
 import { agentWakeupRequests, agents, companies, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, issueThreadInteractions, issues, secretAccessEvents } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { acceptSteeredIdentity, captureRunIdentity, initializeRunIdentity, listRunIdentityContexts, rejectSteeredIdentity, reserveSteeredIdentity } from "../services/run-identity.js";
@@ -142,6 +147,30 @@ const support = await getEmbeddedPostgresTestSupport();
     await acceptSteeredIdentity(db, a!);
     await acceptSteeredIdentity(db, b!);
     expect((await captureRunIdentity(db, input, options)).context?.responsibleUserId).toBe("A");
+  });
+  it("drops the run's kept GitHub broker answer when it reserves a steered identity", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "paperclip-steer-answer-"));
+    vi.stubEnv("TMPDIR", root);
+    try {
+      const input = await seed();
+      await initializeRunIdentity(db, { ...input, messageIds: [], responsibleUserId: "A", cause: "instruction" });
+      const answers = await Promise.all([input.runId, randomUUID()].map(async (runId) => {
+        const directory = githubOperationLauncherDirectory({ runId, target: null });
+        await mkdir(directory, { recursive: true });
+        const file = path.join(directory, GITHUB_BROKER_ANSWER_FILE);
+        await writeFile(file, "{}");
+        return file;
+      }));
+      const exists = (file: string) => stat(file).then(() => true, () => false);
+      expect(await reserveSteeredIdentity(db, { ...input, messageId: input.messageIds[1] })).not.toBeNull();
+      expect(await Promise.all(answers.map(exists))).toEqual([false, true]);
+      await writeFile(answers[0], "{}");
+      await expect(reserveSteeredIdentity(db, { ...input, messageId: input.messageIds[2] })).rejects.toThrow(/reconciled/);
+      expect(await Promise.all(answers.map(exists))).toEqual([true, true]);
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(root, { recursive: true, force: true });
+    }
   });
   it("keeps rejected steering unchanged and preserves the originating identity on retry", async () => {
     const input = await seed();

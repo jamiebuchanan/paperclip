@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, stat, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
-import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { discardGitHubBrokerAnswer, githubOperationLauncherDirectory } from "./execution-target.js";
+import { GITHUB_BROKER_ANSWER_FILE, GITHUB_BROKER_ANSWER_TTL_MS, githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
 const exec = promisify(execFile);
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -51,7 +52,7 @@ describe("managed GitHub launchers", () => {
     else cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
     const configRoot = path.join(root, "config");
     if (failure === "config-unwritable") await writeFile(configRoot, "not a directory");
-    const result = await exec(path.join(bin, "git"), ["status", "--porcelain"], { cwd: root, env: {
+    const result = await exec(path.join(bin, "git"), ["remote"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
@@ -182,4 +183,139 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(env.GH_TOKEN).toBe("");
     expect(env.GIT_AUTHOR_NAME).toBe("");
   });
+  it("keeps local Git commands off the broker and still asks for the rest", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-local-skip-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    let posts = 0;
+    const server = createServer((_req, res) => {
+      posts++;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: {
+        GH_TOKEN: "managed-token", GIT_AUTHOR_NAME: "Managed", GIT_AUTHOR_EMAIL: "managed@example.test",
+        GIT_COMMITTER_NAME: "Managed", GIT_COMMITTER_EMAIL: "managed@example.test",
+      } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }), PATH: `${bin}:${process.env.PATH}` };
+    const git = async (...args: string[]) => {
+      const before = posts;
+      const { stdout } = await exec(path.join(bin, "git"), args, { cwd: root, env }).catch(() => ({ stdout: "" }));
+      return { stdout: stdout.trim(), posts: posts - before };
+    };
+    for (const args of [
+      ["init", "-q", "repo"],
+      ["-C", "repo", "status", "--short"],
+      ["-C", "repo", "-c", "core.quotepath=off", "--no-pager", "diff"],
+      ["--git-dir=repo/.git", "rev-parse", "--git-dir"],
+      ["--git-dir", "repo/.git", "--work-tree", "repo", "status"],
+      ["-C", "repo", "config", "user.useConfigOnly"],
+      ["--version"],
+    ]) expect((await git(...args)).posts, args.join(" ")).toBe(0);
+    expect((await git("-C", "repo", "config", "user.useConfigOnly")).stdout).toBe("true");
+    for (const args of [
+      ["-C", "repo", "remote"],
+      ["-C", "repo", "fetch", "--dry-run"],
+      ["-C", "repo", "-c", "alias.noop=!true", "noop"],
+      ["-C", "repo", "--unknown-option", "status"],
+      ["-C"],
+    ]) expect((await git(...args)).posts, args.join(" ")).toBe(1);
+    expect((await git("-C", "repo", "commit", "--allow-empty", "-m", "Managed work")).posts).toBe(1);
+    expect((await git("-C", "repo", "log", "-1", "--format=%an <%ae>")).stdout).toBe("Managed <managed@example.test>");
+  });
+
+  it("reuses one broker token per run only when reuse is enabled, and never keeps other answers", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-reuse-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    let posts = 0, mode: "available" | "unavailable" = "available";
+    const server = createServer((_req, res) => {
+      posts++;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(mode === "available" ? { status: "available", env: {
+        GH_TOKEN: `token-${posts}`, GIT_AUTHOR_NAME: "Managed", GIT_AUTHOR_EMAIL: "managed@example.test",
+        GIT_COMMITTER_NAME: "Managed", GIT_COMMITTER_EMAIL: "managed@example.test",
+      } } : { status: "unavailable", reason: "Not for this run", env: { GH_TOKEN: "must-not-be-used" } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const url = `http://127.0.0.1:${port}`;
+    const answerPath = path.join(bin, GITHUB_BROKER_ANSWER_FILE);
+    const run = async (reuse: boolean, args: string[], token = "run-capability") => {
+      const before = posts;
+      const env = { ...process.env, ...githubBrokerEnvironment({}, { url, token, reuse }), PATH: `${bin}:${process.env.PATH}` };
+      const { stdout } = await exec(path.join(bin, "git"), ["-c", "alias.token=!echo $GH_TOKEN", ...args], { cwd: root, env });
+      return { stdout: stdout.trim(), posts: posts - before };
+    };
+    const exists = () => stat(answerPath).then(() => true, () => false);
+
+    expect(await run(false, ["token"])).toEqual({ stdout: "token-1", posts: 1 });
+    expect(await run(false, ["token"])).toEqual({ stdout: "token-2", posts: 1 });
+    expect(await exists()).toBe(false);
+
+    expect(await run(true, ["token"])).toEqual({ stdout: "token-3", posts: 1 });
+    expect((await stat(answerPath)).mode & 0o777).toBe(0o600);
+    expect(await run(true, ["token"])).toEqual({ stdout: "token-3", posts: 0 });
+    expect((await run(true, ["var", "GIT_AUTHOR_IDENT"])).stdout).toMatch(/^Managed <managed@example.test>/);
+    expect((await run(true, ["var", "GIT_AUTHOR_IDENT"])).posts).toBe(0);
+    expect(await run(false, ["token"])).toEqual({ stdout: "token-4", posts: 1 });
+
+    expect(await run(true, ["token"], "another-capability")).toEqual({ stdout: "token-5", posts: 1 });
+    expect(await run(true, ["token"])).toEqual({ stdout: "token-6", posts: 1 });
+
+    const kept = JSON.parse(await readFile(answerPath, "utf8"));
+    for (const body of [
+      { ...kept, savedAt: Date.now() - GITHUB_BROKER_ANSWER_TTL_MS - 1 },
+      { ...kept, savedAt: Date.now() + 60_000 },
+      "not json",
+    ]) {
+      await writeFile(answerPath, typeof body === "string" ? body : JSON.stringify(body), { mode: 0o600 });
+      const before = posts;
+      expect((await run(true, ["token"])).posts).toBe(1);
+      expect(posts - before).toBe(1);
+    }
+
+    await rm(answerPath, { force: true });
+    mode = "unavailable";
+    expect(await run(true, ["token"])).toEqual({ stdout: "", posts: 1 });
+    expect(await run(true, ["token"])).toEqual({ stdout: "", posts: 1 });
+    expect(await exists()).toBe(false);
+  }, 20_000);
+
+  it("drops a kept broker token when the run's answer is discarded", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-discard-"));
+    cleanups.push(async () => { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); });
+    vi.stubEnv("TMPDIR", root);
+    const [first, second] = ["run-discard-a", "run-discard-b"].map(runId => githubOperationLauncherDirectory({ runId, target: null }));
+    for (const directory of [first, second]) {
+      await mkdir(directory, { recursive: true });
+      await writeFile(path.join(directory, "git"), githubLauncherSource(), { mode: 0o700 });
+    }
+    let posts = 0;
+    const server = createServer((_req, res) => {
+      posts++;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: `token-${posts}` } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const token = async (directory: string) => {
+      const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability", reuse: true }), PATH: `${directory}:${process.env.PATH}` };
+      return (await exec(path.join(directory, "git"), ["-c", "alias.token=!echo $GH_TOKEN", "token"], { cwd: root, env })).stdout.trim();
+    };
+    expect([await token(first), await token(first), await token(second)]).toEqual(["token-1", "token-1", "token-2"]);
+    await discardGitHubBrokerAnswer("run-discard-a");
+    await discardGitHubBrokerAnswer("run-discard-missing");
+    await discardGitHubBrokerAnswer("../run-discard-b");
+    expect([await token(first), await token(second)]).toEqual(["token-3", "token-2"]);
+    expect(posts).toBe(3);
+  }, 20_000);
 });

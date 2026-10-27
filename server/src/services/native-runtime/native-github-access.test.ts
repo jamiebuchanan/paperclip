@@ -84,6 +84,7 @@ function request(broker: NativeGitHubAccess, extra: RequestInit = {}, endpoint =
 }
 it.each([false, true])("resolves managed GitHub credentials from OpenCode shell operations (runner projection: %s)", async throughRunner => {
   const b = await broker();
+  expect(b.env.PAPERCLIP_GITHUB_BROKER_REUSE).toBe("");
   const command = path.join(b.root, "fake-opencode-server.mjs");
   const fixture = new URL("../../../../packages/paperclip-runner/test/fixtures/fake-opencode-server.mjs", import.meta.url);
   await writeFile(command, await readFile(fixture), { mode: 0o700 });

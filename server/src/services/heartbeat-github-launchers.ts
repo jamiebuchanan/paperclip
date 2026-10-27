@@ -40,6 +40,7 @@ export async function prepareHeartbeatGitHubLaunchers(
   const env = githubBrokerEnvironment(input.env, {
     url: anonymous ? "" : input.brokerUrl,
     token: anonymous ? "" : input.createBrokerToken(),
+    reuse: !anonymous && input.target?.kind !== "remote",
   });
   try {
     return {

@@ -6,7 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
-import { githubLauncherSource } from "./github-launcher.js";
+import { GITHUB_BROKER_ANSWER_FILE, githubLauncherSource } from "./github-launcher.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {
   prepareCommandManagedRuntime,
@@ -1594,6 +1594,12 @@ export function githubOperationLauncherDirectory(input: GitHubLauncherLocation):
     ? path.posix.join(input.target.remoteCwd, ".paperclip-runtime",
         ...(input.target.transport === "sandbox" ? ["paperclip-runner"] : []), "github", input.runId)
     : path.join(os.tmpdir(), "paperclip-github-runtime", input.runId);
+}
+
+export async function discardGitHubBrokerAnswer(runId: string): Promise<void> {
+  if (!/^[a-zA-Z0-9_-]+$/.test(runId)) return;
+  const directory = githubOperationLauncherDirectory({ runId, target: null });
+  await fs.rm(path.join(directory, GITHUB_BROKER_ANSWER_FILE), { force: true });
 }
 
 /** Call only after execution settles, before releasing its remote environment lease. */

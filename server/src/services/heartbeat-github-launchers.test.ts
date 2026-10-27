@@ -85,6 +85,19 @@ describe("heartbeat GitHub launcher lifetime", () => {
     expect(result.cleanupLocation).toEqual({ runId: "run-one", target: mode.target });
     expect(result.env.PAPERCLIP_GITHUB_BROKER_TOKEN).toBe("current-run-secret");
   });
+
+  it.each([
+    ["a local run", { native: false, githubConfigured: true, target: null }, "1"],
+    ["a local run without GitHub configured", { native: false, githubConfigured: false, target: null }, "1"],
+    ["a remote run", { native: false, githubConfigured: true, target }, ""],
+    ["an anonymous native sandbox", { native: true, githubConfigured: false, target }, ""],
+    ["a native run owned by its session", { native: true, githubConfigured: true, target: null }, ""],
+  ])("lets only a run-scoped local launcher reuse its broker answer: %s", async (_label, mode, reuse) => {
+    const result = await prepareHeartbeatGitHubLaunchers({ ...mode, agentId: "agent-a", runId: "run-one",
+      cwd: "/workspace", env: {}, brokerUrl: "https://paperclip.test", createBrokerToken: () => "current-run-secret" },
+      async (input) => input.env);
+    expect(result.env.PAPERCLIP_GITHUB_BROKER_REUSE).toBe(reuse);
+  });
 });
 
 
