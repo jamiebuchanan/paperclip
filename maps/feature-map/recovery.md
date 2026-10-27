@@ -36,6 +36,10 @@ Agent access: [companion](../agent-access-map/recovery.md).
   workspace link when the destination is disabled. Local PostgreSQL and real
   filesystem regressions cover native and legacy recovery and one-time delivery;
   hosted provider recovery remains separate acceptance.
+  Snapshot-only historical recovery can continue the same saved human input in
+  one fresh isolated attempt, with recovered files attached rather than claiming
+  native copyback. Real PostgreSQL/filesystem regressions cover board and inbound
+  ownership, sibling holds, restart/race delivery and unchanged source records.
   Native finalization deadline failures also retain the exact prepared source
   for the same stop-and-save workflow before Retry admits another executor.
   Retry reconstructs missing preservation for historical failures only from an

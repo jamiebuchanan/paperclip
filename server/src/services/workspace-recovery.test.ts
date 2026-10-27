@@ -744,8 +744,19 @@ describe("automatic retained workspace recovery", () => {
     expect(await readFile(path.join(f.host, "newer.txt"), "utf8")).toBe("newer local work\n");
   });
 
-  it.each(["native", "legacy", "native_export", "legacy_snapshot"])("delivers only saved user input once through ordinary admission: %s", async mode => {
-    const f = await seed(mode.startsWith("legacy") ? "legacy" : "native", mode !== "legacy_snapshot"), commentId = randomUUID(), queueId = randomUUID();
+  it.each(["native", "legacy", "native_export", "legacy_snapshot", "native_snapshot"])("delivers only saved user input once through ordinary admission: %s", async mode => {
+    const f = await seed(mode.startsWith("legacy") ? "legacy" : "native", !mode.endsWith("_snapshot")), commentId = randomUUID(), queueId = randomUUID();
+    if (mode === "native_snapshot") {
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeWorkspaceSync: {
+        schema: "paperclip.native-workspace-sync/v3", state: "prepared", descriptorSha256: "a".repeat(64),
+        baselineSha256: "b".repeat(64), finalHostSha256: null, workspaceId: f.issueId,
+        leaseId: f.lease.id, providerLeaseId: f.providerLeaseId, remoteCwd: f.remote, resourceDisposition: "destroy",
+      } } }).where(eq(heartbeatRuns.id, f.runId));
+      await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "active_run_watchdog", status: "resolved", ownerType: "system", outcome: "blocked",
+        cause: "execution_finalization_deadline_exceeded", fingerprint: randomUUID(), nextAction: "Inspect original failure",
+        evidence: { runId: f.runId, automaticRecovery: { replay: "blocked" } } });
+    }
     if (mode === "native_export") {
       await db.update(issueRecoveryActions).set({ cause: "native_workspace_sync_out_retry_exhausted", evidence: { runId: f.runId } }).where(eq(issueRecoveryActions.id, f.actionId));
       await db.update(heartbeatRuns).set({ resultJson: {} }).where(eq(heartbeatRuns.id, f.runId));
@@ -767,8 +778,19 @@ describe("automatic retained workspace recovery", () => {
     expect(turns[0].contextSnapshot).toMatchObject({ forceFreshSession: true, previousRunId: f.runId, wakeCommentIds: [commentId] });
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId)))[0]).toMatchObject({ status: "coalesced", runId: turns[0].id });
     expect((await run(f.runId)).status).toBe("failed");
-    if (mode === "legacy_snapshot") expect(await readFreshWorkspaceReadiness(db, turns[0])).toMatchObject({
-      mode: "fresh_isolated_workspace", retryIntentId: queueId, sourceRunId: f.runId, retainedSourceIds: [f.lease.id] });
+    if (mode.endsWith("_snapshot")) {
+      expect(await readFreshWorkspaceReadiness(db, turns[0])).toMatchObject({
+        mode: "fresh_isolated_workspace", retryIntentId: queueId, sourceRunId: f.runId, retainedSourceIds: [f.lease.id] });
+      const fresh = path.join(root, randomUUID()); await mkdir(fresh);
+      const attached = await attachPreservedWorkspaceSnapshots({ db, companyId: f.companyId, issueId: f.issueId,
+        sourceRunIds: [turns[0].id], cwd: fresh });
+      expect(attached).toHaveLength(1);
+      expect(await readFile(path.join(attached[0].path, "files", "saved.txt"), "utf8")).toBe("finished work\n");
+      expect(await readFile(path.join(f.host, "newer.txt"), "utf8")).toBe("newer local work\n");
+      expect(await hasVerifiedWorkspaceRepair(db, await run(f.runId))).toBe(false);
+      if (mode === "native_snapshot") expect((await run(f.runId)).runnerProfileJson?.nativeWorkspaceSync)
+        .toMatchObject({ state: "prepared", finalHostSha256: null });
+    }
   }, 30_000);
 
   it.each(["copyback_unknown", "source_unavailable", "executor_unknown"])("ordinary task Retry evaluates fresh isolation independently: %s", async failure => {

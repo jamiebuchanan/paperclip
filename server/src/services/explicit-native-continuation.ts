@@ -1,3 +1,4 @@
+import { assertDurableChatWakeupRequest, assertDurableChatWakeupReceipt, type DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
 import { canSelectFreshWorkspace, type ContinuationReadiness } from "./fresh-workspace-continuation.js";
 import { readTaskRetryIntent } from "./task-retry.js";
@@ -91,6 +92,7 @@ export async function admitExplicitNativeContinuation(input: {
   queuedCommentInterruptId?: string;
   /** Internal delivery of an unconsumed, user-authored saved queue entry. */
   queuedCommentRequestId?: string;
+  durableChatRequest?: DurableChatWakeupRequest;
   dryRun?: boolean;
   onBlocked?: (reason: string, message: string) => void;
 }): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string; taskRetryRequestId?: string; readiness?: ContinuationReadiness } | null> {
@@ -135,6 +137,21 @@ export async function admitExplicitNativeContinuation(input: {
     !savedQueue.idempotencyKey?.startsWith("chat-inbound:") &&
     queuedCommentIdsFromWakePayload(savedQueue.payload).includes(commentId));
   if (input.queuedCommentRequestId && !queuedRequest) return null;
+  const chatRequest = input.durableChatRequest;
+  let savedChatRequestId: string | undefined;
+  if (chatRequest) {
+    assertDurableChatWakeupRequest(chatRequest, { companyId, issueId, agentId, commentId,
+      requestedByActorType: input.actorType ?? undefined, requestedByActorId: actorId });
+    if (chatRequest.failedRunRetry || !chatRequest.resumeDeferred) return null;
+    const [receipt] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.id, chatRequest.id), eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      isNull(agentWakeupRequests.runId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+    ));
+    if (!receipt || !commentId || !queuedCommentIdsFromWakePayload(receipt.payload).includes(commentId)) return null;
+    assertDurableChatWakeupReceipt(chatRequest, receipt);
+    savedChatRequestId = receipt.id;
+  }
   let partiallyDeliveredQueue = false;
   if (queuedRequest) {
     const ids = queuedCommentIdsFromWakePayload(savedQueue!.payload);
@@ -198,20 +215,18 @@ export async function admitExplicitNativeContinuation(input: {
     const unusedAdmission = run.status === "cancelled" && !run.startedAt &&
       run.errorCode === "execution_reconciliation_required" &&
       !run.processPid && !run.processGroupId && !run.nativeSessionId;
-    // Several retained holds may describe this same failed execution. Reuse
-    // its current explicit Retry strategy for a historical hold that predates
-    // system recovery. Every hold still passes the stop/effect checks below.
     const sourceRunId = run.id;
-    const strategyEvidence = input.taskRetryRequestId && !Object.hasOwn(action.evidence, "systemRecovery")
+    const strategyRequestId = input.taskRetryRequestId ?? input.queuedCommentRequestId ?? savedChatRequestId;
+    const strategyEvidence = strategyRequestId && !Object.hasOwn(action.evidence, "systemRecovery")
       ? actions.find(candidate => {
           const recovery = readSystemRecovery(candidate.evidence);
           return candidate.evidence.runId === sourceRunId && recovery?.sourceRunId === sourceRunId &&
-            recovery.intentId === input.taskRetryRequestId;
+            (input.taskRetryRequestId ? recovery.intentId === input.taskRetryRequestId : true);
         })?.evidence ?? action.evidence
       : action.evidence;
     const freshIntent = await canSelectFreshWorkspace({ db, companyId, issueId, agentId, actorId,
       sourceRunId: run.id, evidence: strategyEvidence, taskRetryRequestId: input.taskRetryRequestId,
-      queuedRequestId: input.queuedCommentRequestId });
+      queuedRequestId: input.queuedCommentRequestId ?? savedChatRequestId });
     const legacyUserTurn = run.runtimeMode === "legacy" &&
       action.cause === "legacy_execution_requires_reconciliation" &&
       (isConversationAdapter(agent.adapterType) ||
