@@ -1,13 +1,9 @@
-export const GITHUB_BROKER_ANSWER_FILE = ".broker-answer.json";
-export const GITHUB_BROKER_ANSWER_TTL_MS = 5 * 60_000;
-
 /** Standalone source is staged unchanged on local, SSH, and sandbox runtimes. No secrets in files. */
 export function githubLauncherSource(): string {
   return String.raw`#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { createHash } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const directory = path.dirname(fs.realpathSync(process.argv[1]));
 const program = path.basename(process.argv[1]);
@@ -21,7 +17,7 @@ if (!['git', 'gh'].includes(program) || !executable) {
   process.stderr.write('Paperclip: requested GitHub command is not installed.\n');
   process.exit(127);
 }
-const localGitCommands = new Set(['init', 'status', 'add', 'config', 'rev-parse', 'log', 'diff', 'show', 'branch', 'checkout', 'switch', 'restore', 'reset', 'rm', 'mv', 'worktree', 'grep', 'blame', 'describe', 'ls-files', 'ls-tree', 'cat-file', 'rev-list', 'merge-base', 'show-ref', 'for-each-ref', 'symbolic-ref', 'check-ignore', 'var', 'version', 'help']);
+const localGitCommands = new Set(['init', 'status', 'add', 'config', 'rev-parse', 'log', 'diff', 'show', 'branch', 'checkout', 'switch', 'restore', 'reset', 'rm', 'mv', 'worktree', 'grep', 'blame', 'describe', 'ls-files', 'ls-tree', 'cat-file', 'rev-list', 'merge-base', 'show-ref', 'for-each-ref', 'symbolic-ref', 'check-ignore', 'version', 'help']);
 const gitValueOptions = ['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix', '--attr-source'];
 const gitFlagOptions = ['-p', '-P', '--paginate', '--no-pager', '--bare', '--no-replace-objects', '--no-lazy-fetch', '--no-optional-locks', '--no-advice', '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs'];
 function isLocalGit(args) {
@@ -34,25 +30,6 @@ function isLocalGit(args) {
     return arg === '--version' || arg === '--help' || localGitCommands.has(arg);
   }
   return false;
-}
-const answerFile = path.join(directory, '${GITHUB_BROKER_ANSWER_FILE}');
-const answerKey = (env) => createHash('sha256').update(env.PAPERCLIP_GITHUB_BROKER_TOKEN || '').digest('hex');
-function readKeptAnswer(env) {
-  if (env.PAPERCLIP_GITHUB_BROKER_REUSE !== '1') return null;
-  try {
-    const kept = JSON.parse(fs.readFileSync(answerFile, 'utf8'));
-    const age = Date.now() - kept.savedAt;
-    if (kept.key === answerKey(env) && age >= 0 && age < ${GITHUB_BROKER_ANSWER_TTL_MS} && kept.answer && kept.answer.status === 'available') return kept.answer;
-  } catch {}
-  return null;
-}
-function keepAnswer(env, answer) {
-  if (env.PAPERCLIP_GITHUB_BROKER_REUSE !== '1' || answer.status !== 'available') return;
-  const temporary = answerFile + '.' + process.pid;
-  try {
-    fs.writeFileSync(temporary, JSON.stringify({ key: answerKey(env), savedAt: Date.now(), answer }), { mode: 0o600, flag: 'wx' });
-    fs.renameSync(temporary, answerFile);
-  } catch { try { fs.rmSync(temporary, { force: true }); } catch {} }
 }
 async function main() {
   let env = { ...process.env };
@@ -87,26 +64,10 @@ async function main() {
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
     });
     const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
-    const useAnswer = (result) => {
-      if (result.status === 'unavailable') {
-        const reason = typeof result.reason === 'string'
-          ? result.reason.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 500)
-          : 'Check the GitHub connection in Paperclip';
-        process.stderr.write('Paperclip: GitHub access unavailable: ' + reason + '. Continuing without GitHub credentials.\n');
-      }
-      if (result.status === 'available' && configReady) {
-        for (const [key, value] of Object.entries(result.env || {})) {
-          if (/^(GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_TERMINAL_PROMPT|GIT_AUTHOR_(NAME|EMAIL)|GIT_COMMITTER_(NAME|EMAIL)|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+)$/.test(key) && typeof value === 'string') env[key] = value;
-        }
-      }
-    };
-    const kept = readKeptAnswer(env);
-    const askBroker = !kept && !isLocalGit(process.argv.slice(2));
+    const askBroker = !isLocalGit(process.argv.slice(2));
     try {
     let response;
-    if (kept) {
-      useAnswer(kept);
-    } else if (askBroker && base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
+    if (askBroker && base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
       const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials';
       // A slow or restarting control plane must not cost the operation its
       // managed identity, so a failed request is retried before giving up.
@@ -138,8 +99,17 @@ async function main() {
       if (!response.ok) {
         diagnostic(response.status === 401 || response.status === 403 ? 'capability_rejected' : 'broker_response_unavailable');
       } else {
-      useAnswer(result);
-      keepAnswer(env, result);
+      if (result.status === 'unavailable') {
+        const reason = typeof result.reason === 'string'
+          ? result.reason.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 500)
+          : 'Check the GitHub connection in Paperclip';
+        process.stderr.write('Paperclip: GitHub access unavailable: ' + reason + '. Continuing without GitHub credentials.\n');
+      }
+      if (result.status === 'available' && configReady) {
+        for (const [key, value] of Object.entries(result.env || {})) {
+          if (/^(GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_TERMINAL_PROMPT|GIT_AUTHOR_(NAME|EMAIL)|GIT_COMMITTER_(NAME|EMAIL)|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+)$/.test(key) && typeof value === 'string') env[key] = value;
+        }
+      }
       }
     } else if (askBroker) { diagnostic('capability_missing'); }
     } catch { diagnostic('broker_transport_unavailable'); }
@@ -162,7 +132,7 @@ main().catch(() => { process.stderr.write('Paperclip: GitHub launcher_setup_fail
 }
 
 /** Override inherited credentials even when adapters merge the host environment later. */
-export function githubBrokerEnvironment(input: Record<string, unknown>, broker: { url: string; token: string; reuse?: boolean }): Record<string, string> {
+export function githubBrokerEnvironment(input: Record<string, unknown>, broker: { url: string; token: string }): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(input)) if (typeof value === "string") env[key] = value;
   for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "PAPERCLIP_GIT_TOKEN", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_CONFIG_COUNT", "PAPERCLIP_GITHUB_OPERATION_ACTIVE"]) env[key] = "";
@@ -179,6 +149,5 @@ export function githubBrokerEnvironment(input: Record<string, unknown>, broker: 
   env.SSH_AUTH_SOCK = "";
   env.PAPERCLIP_GITHUB_BROKER_URL = broker.url;
   env.PAPERCLIP_GITHUB_BROKER_TOKEN = broker.token;
-  env.PAPERCLIP_GITHUB_BROKER_REUSE = broker.reuse ? "1" : "";
   return env;
 }

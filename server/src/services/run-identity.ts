@@ -13,7 +13,6 @@ import {
 import { conflict, forbidden } from "../errors.js";
 import { boundRunIssueId, runTaskContextColumn } from "./run-task-binding.js";
 import { isUuidLike } from "@paperclipai/shared";
-import { discardGitHubBrokerAnswer } from "@paperclipai/adapter-utils/execution-target";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
 /** Resolve an explicit click from persisted receipts, never caller context or message authors. */
@@ -378,7 +377,7 @@ export async function reserveSteeredIdentity(
   db: Db,
   input: Parameters<typeof prepareSteeredIdentity>[1],
 ) {
-  const reserved = await db.transaction(async (tx) => {
+  return db.transaction(async (tx) => {
     await lockIdentityTask(tx, input.companyId, input.runId);
     const [run] = await tx
       .select()
@@ -431,8 +430,6 @@ export async function reserveSteeredIdentity(
     }
     return context;
   });
-  await discardGitHubBrokerAnswer(input.runId).catch(() => undefined);
-  return reserved;
 }
 
 export async function rejectSteeredIdentity(
